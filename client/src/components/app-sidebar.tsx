@@ -26,6 +26,7 @@ import {
   Scissors,
   Search,
   Lock,
+  PackageOpen,
 } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 
@@ -74,6 +75,13 @@ const toolsMenu = [
     icon: Box,
     helpTitle: "스마트 박스 패킹",
     helpLines: ["상품을 박스에 최적 배치하는 도구입니다.", "결과를 PNG로 다운로드할 수 있습니다."],
+  },
+  {
+    title: "비주얼 박스 패킹",
+    url: "/tools/smart-box",
+    icon: PackageOpen,
+    helpTitle: "비주얼 박스 패킹 (Visual Box)",
+    helpLines: ["상품 이미지를 3D 박스에 시각적으로 배치합니다.", "배경 자동 제거, 드래그/리사이즈, 채움비율 조절이 가능합니다.", "결과를 PNG로 다운로드할 수 있습니다."],
   },
   {
     title: "상세페이지 빌더",

@@ -1,0 +1,756 @@
+import React, { useState, useRef, useEffect } from 'react';
+import { Upload, Download, RefreshCcw, Box, Move, Trash2, Plus, Layers, Image as ImageIcon, Link as LinkIcon, Wand2, Maximize } from 'lucide-react';
+
+const App = () => {
+  const [products, setProducts] = useState([]);
+  const [selectedId, setSelectedId] = useState(null);
+  const [imageUrlInput, setImageUrlInput] = useState('');
+  const [removeBg, setRemoveBg] = useState(true);
+  const [fillRatio, setFillRatio] = useState(1.0); 
+  const canvasRef = useRef(null);
+
+  // 인터랙션 모드 상태 (이동 vs 크기조절)
+  const interactionMode = useRef('none'); // 'none', 'move', 'resize'
+  const initialDragData = useRef({ 
+    startX: 0, startY: 0, 
+    initialScale: 1, 
+    initialDist: 0 
+  });
+
+  // 박스 설정
+  const BOX_CONFIG = {
+    width: 600,
+    height: 500,
+    frontHeight: 180,
+    backHeight: 250,
+    perspective: 40,
+    colorInner: '#C8AD94',
+    colorOuter: '#E3Cbad',
+    colorShadow: '#A68B73',
+  };
+
+  // 1. 스마트 배경 제거 (Flood Fill 알고리즘)
+  const processImageBackground = (imgSrc) => {
+    return new Promise((resolve) => {
+      const img = new Image();
+      img.crossOrigin = "Anonymous";
+      img.src = imgSrc;
+      
+      img.onload = () => {
+        if (!removeBg) {
+          resolve({ src: imgSrc, width: img.width, height: img.height, ratio: img.width / img.height });
+          return;
+        }
+
+        const canvas = document.createElement('canvas');
+        canvas.width = img.width;
+        canvas.height = img.height;
+        const ctx = canvas.getContext('2d');
+        ctx.drawImage(img, 0, 0);
+        
+        const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+        const data = imageData.data;
+        const width = canvas.width;
+        const height = canvas.height;
+
+        const visited = new Uint8Array(width * height);
+        const queue = [];
+
+        const isWhite = (index) => {
+          return data[index] > 230 && data[index + 1] > 230 && data[index + 2] > 230;
+        };
+
+        for (let x = 0; x < width; x++) {
+          if (isWhite((0 * width + x) * 4)) queue.push([x, 0]);
+          if (isWhite(((height - 1) * width + x) * 4)) queue.push([x, height - 1]);
+        }
+        for (let y = 0; y < height; y++) {
+          if (isWhite((y * width + 0) * 4)) queue.push([0, y]);
+          if (isWhite((y * width + (width - 1)) * 4)) queue.push([width - 1, y]);
+        }
+
+        const dx = [1, -1, 0, 0];
+        const dy = [0, 0, 1, -1];
+
+        while (queue.length > 0) {
+          const [cx, cy] = queue.shift();
+          const idx = (cy * width + cx);
+
+          if (visited[idx]) continue;
+          visited[idx] = 1;
+
+          const dataIdx = idx * 4;
+          data[dataIdx + 3] = 0; 
+
+          for (let i = 0; i < 4; i++) {
+            const nx = cx + dx[i];
+            const ny = cy + dy[i];
+
+            if (nx >= 0 && nx < width && ny >= 0 && ny < height) {
+              const nIdx = (ny * width + nx);
+              const nDataIdx = nIdx * 4;
+              
+              if (!visited[nIdx] && isWhite(nDataIdx)) {
+                 queue.push([nx, ny]);
+              }
+            }
+          }
+        }
+        
+        ctx.putImageData(imageData, 0, 0);
+        resolve({ 
+          src: canvas.toDataURL(), 
+          width: img.width, 
+          height: img.height,
+          ratio: img.width / img.height
+        });
+      };
+
+      img.onerror = () => {
+        resolve({ src: imgSrc, width: 100, height: 100, ratio: 1 });
+      };
+    });
+  };
+
+  const handleImageUpload = async (e) => {
+    const files = Array.from(e.target.files);
+    if (files.length === 0) return;
+
+    const processedItems = await Promise.all(files.map(async (file) => {
+      const rawUrl = URL.createObjectURL(file);
+      const processed = await processImageBackground(rawUrl);
+      
+      return {
+        id: Date.now() + Math.random(),
+        src: processed.src,
+        rawFile: file,
+        ratio: processed.ratio,
+        x: 0, y: 0,
+        width: 120,
+        height: 120 / processed.ratio,
+        rotation: 0,
+        scale: 1,
+        zIndex: 0,
+        brightness: 100,
+      };
+    }));
+
+    setProducts(prev => {
+      const updated = [...prev, ...processedItems];
+      return smartPack(updated, fillRatio);
+    });
+  };
+
+  const handleUrlAdd = async () => {
+    if (!imageUrlInput.trim()) return;
+    
+    const processed = await processImageBackground(imageUrlInput);
+    const newProduct = {
+        id: Date.now() + Math.random(),
+        src: processed.src,
+        ratio: processed.ratio,
+        x: 0, y: 0,
+        width: 120,
+        height: 120 / processed.ratio,
+        rotation: 0,
+        scale: 1,
+        zIndex: 0,
+        brightness: 100,
+    };
+
+    setProducts(prev => smartPack([...prev, newProduct], fillRatio));
+    setImageUrlInput('');
+  };
+
+  const pseudoRandom = (seed) => {
+      const x = Math.sin(seed++) * 10000;
+      return x - Math.floor(x);
+  };
+
+  const smartPack = (currentProducts, ratio = 1.0) => {
+    if (!currentProducts || currentProducts.length === 0) return [];
+
+    const count = currentProducts.length;
+    let newProducts = [...currentProducts];
+    
+    const boxWidth = 360;
+    const centerX = 400; 
+    const centerY = 350; 
+
+    const spreadRatio = 1 + (ratio - 1) * 0.6;
+
+    const createSlots = (rowCount, yBase, scaleBase, zIndexBase, brightness, seedOffset) => {
+        const slots = [];
+        const currentBoxWidth = boxWidth * spreadRatio;
+        
+        for(let i=0; i<rowCount; i++) {
+            const xOffset = (i - (rowCount-1)/2) * (currentBoxWidth / (rowCount + (rowCount > 1 ? 0.5 : 0))); 
+            const archY = Math.abs(xOffset) * 0.1; 
+            
+            const rndScale = pseudoRandom(i + seedOffset) * 0.1 - 0.05;
+            const rndRot = (pseudoRandom(i + seedOffset + 100) * 20 - 10);
+
+            slots.push({
+                x: centerX + xOffset,
+                y: yBase + archY,
+                scale: (scaleBase + rndScale) * ratio,
+                rotation: rndRot + (xOffset * 0.05),
+                zIndex: zIndexBase + i,
+                brightness: brightness
+            });
+        }
+        return slots;
+    };
+
+    let slots = [];
+
+    if (count <= 3) {
+        slots = createSlots(count, centerY - 20, 1.2, 50, 100, 0);
+    } else if (count <= 6) {
+        const backCount = Math.ceil(count / 2);
+        const frontCount = count - backCount;
+        
+        slots = [
+            ...createSlots(backCount, centerY - 60, 0.9, 10, 90, 10),
+            ...createSlots(frontCount, centerY + 20, 1.1, 50, 100, 20)
+        ];
+    } else {
+        const backCount = Math.ceil(count * 0.4);
+        const midCount = Math.ceil(count * 0.35);
+        const frontCount = count - backCount - midCount;
+        
+        slots = [
+            ...createSlots(backCount, centerY - 80, 0.85, 10, 85, 30),
+            ...createSlots(midCount, centerY - 10, 1.0, 40, 95, 40),
+            ...createSlots(frontCount, centerY + 50, 1.15, 70, 105, 50)
+        ];
+    }
+
+    return newProducts.map((p, i) => {
+        const slot = slots[i % slots.length];
+        return {
+            ...p,
+            x: slot.x,
+            y: slot.y,
+            scale: slot.scale,
+            rotation: slot.rotation,
+            zIndex: slot.zIndex,
+            brightness: slot.brightness
+        };
+    });
+  };
+
+  useEffect(() => {
+    if (products.length > 0) {
+        setProducts(prev => smartPack(prev, fillRatio));
+    }
+  }, [fillRatio]);
+
+  const handleAutoPack = () => {
+      setProducts(smartPack(products, fillRatio));
+  };
+
+  const deleteSelected = () => {
+    if (selectedId) {
+      const newArr = products.filter(p => p.id !== selectedId);
+      setProducts(newArr);
+      setSelectedId(null);
+    }
+  };
+
+  // --- 렌더링 루프 ---
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    
+    const cx = canvas.width / 2;
+    const cy = canvas.height / 2 + 50;
+
+    drawBoxBack(ctx, cx, cy);
+
+    const sortedProducts = [...products].sort((a, b) => a.zIndex - b.zIndex);
+
+    sortedProducts.forEach(product => {
+      const img = new Image();
+      img.src = product.src;
+
+      ctx.save();
+      ctx.translate(product.x, product.y);
+      ctx.rotate((product.rotation * Math.PI) / 180);
+      ctx.scale(product.scale, product.scale);
+
+      // 그림자
+      ctx.shadowColor = "rgba(0,0,0,0.4)";
+      ctx.shadowBlur = 15;
+      ctx.shadowOffsetY = 10;
+      
+      if (img.complete) {
+        try {
+            ctx.drawImage(img, -product.width / 2, -product.height / 2, product.width, product.height);
+            
+            // 선택된 경우 UI 표시
+            if (product.id === selectedId) {
+                // 테두리
+                ctx.shadowBlur = 0;
+                ctx.shadowOffsetY = 0;
+                ctx.strokeStyle = "#3b82f6";
+                ctx.lineWidth = 2 / product.scale; // 스케일 무관하게 일정한 두께
+                ctx.strokeRect(-product.width / 2, -product.height / 2, product.width, product.height);
+                
+                // 모서리 핸들 그리기
+                ctx.fillStyle = "#fff";
+                ctx.strokeStyle = "#3b82f6";
+                ctx.lineWidth = 2 / product.scale;
+
+                // 핸들 크기 (화면상 10px 정도로 유지)
+                const handleRadius = 6 / product.scale;
+                
+                const halfW = product.width / 2;
+                const halfH = product.height / 2;
+                
+                const corners = [
+                    { x: -halfW, y: -halfH }, // TL
+                    { x: halfW, y: -halfH },  // TR
+                    { x: halfW, y: halfH },   // BR
+                    { x: -halfW, y: halfH }   // BL
+                ];
+
+                corners.forEach(c => {
+                    ctx.beginPath();
+                    ctx.arc(c.x, c.y, handleRadius, 0, Math.PI * 2);
+                    ctx.fill();
+                    ctx.stroke();
+                });
+            }
+        } catch (e) { }
+      }
+      ctx.restore();
+    });
+
+    drawBoxFront(ctx, cx, cy);
+
+  }, [products, selectedId]);
+
+  // 박스 그리기 (Back)
+  const drawBoxBack = (ctx, cx, cy) => {
+    const w = 420; 
+    const h = 260; 
+    
+    ctx.save();
+    ctx.fillStyle = BOX_CONFIG.colorInner;
+    ctx.beginPath();
+    ctx.moveTo(cx - w/2, cy - h/2);
+    ctx.lineTo(cx + w/2, cy - h/2);
+    ctx.lineTo(cx + w/2, cy + h/2 - 40); 
+    ctx.lineTo(cx - w/2, cy + h/2 - 40);
+    ctx.fill();
+    
+    const gradient = ctx.createLinearGradient(cx, cy - h/2, cx, cy + h/2);
+    gradient.addColorStop(0, "rgba(0,0,0,0.2)");
+    gradient.addColorStop(1, "rgba(0,0,0,0)");
+    ctx.fillStyle = gradient;
+    ctx.fill();
+
+    ctx.fillStyle = '#bca086';
+    ctx.beginPath();
+    ctx.moveTo(cx - w/2, cy - h/2);
+    ctx.lineTo(cx + w/2, cy - h/2);
+    ctx.lineTo(cx + w/2 - 30, cy - h/2 - 80);
+    ctx.lineTo(cx - w/2 + 30, cy - h/2 - 80);
+    ctx.fill();
+    ctx.restore();
+  };
+
+  // 박스 그리기 (Front)
+  const drawBoxFront = (ctx, cx, cy) => {
+    const w = 420;
+    const h = 180; 
+    const topY = cy + 50; 
+    const bottomY = topY + h;
+
+    ctx.save();
+    ctx.fillStyle = BOX_CONFIG.colorOuter;
+    ctx.beginPath();
+    ctx.moveTo(cx - w/2, topY);
+    ctx.lineTo(cx + w/2, topY);
+    ctx.lineTo(cx + w/2, bottomY);
+    ctx.lineTo(cx - w/2, bottomY);
+    ctx.fill();
+
+    ctx.strokeStyle = "rgba(0,0,0,0.03)";
+    ctx.lineWidth = 2;
+    for(let i=cx-w/2; i<cx+w/2; i+=10) {
+        ctx.beginPath();
+        ctx.moveTo(i, topY);
+        ctx.lineTo(i, bottomY);
+        ctx.stroke();
+    }
+
+    ctx.strokeStyle = "#8d6e53";
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.moveTo(cx - 30, topY + 60);
+    ctx.lineTo(cx, topY + 30);
+    ctx.lineTo(cx + 30, topY + 60);
+    ctx.stroke();
+    ctx.strokeRect(cx - 20, topY + 60, 40, 40);
+    
+    ctx.font = "bold 20px sans-serif";
+    ctx.fillStyle = "#8d6e53";
+    ctx.textAlign = "center";
+    ctx.fillText("PREMIUM SNACK", cx, topY + 130);
+    
+    ctx.fillStyle = '#d4bb9e';
+    ctx.beginPath();
+    ctx.moveTo(cx - w/2, topY);
+    ctx.lineTo(cx - w/2, bottomY);
+    ctx.lineTo(cx - w/2 - 90, bottomY - 40);
+    ctx.lineTo(cx - w/2 - 90, topY - 40);
+    ctx.fill();
+    
+    ctx.beginPath();
+    ctx.moveTo(cx + w/2, topY);
+    ctx.lineTo(cx + w/2, bottomY);
+    ctx.lineTo(cx + w/2 + 90, bottomY - 40);
+    ctx.lineTo(cx + w/2 + 90, topY - 40);
+    ctx.fill();
+    
+    ctx.restore();
+  };
+
+  // --- 마우스/터치 로직 ---
+
+  const getCanvasPos = (e) => {
+    const rect = canvasRef.current.getBoundingClientRect();
+    const clientX = e.clientX || e.touches[0].clientX;
+    const clientY = e.clientY || e.touches[0].clientY;
+    return { x: clientX - rect.left, y: clientY - rect.top };
+  };
+
+  // 헬퍼: 회전된 사각형의 4개 코너 좌표(Screen Space) 구하기
+  const getProductCorners = (p) => {
+    const rad = (p.rotation * Math.PI) / 180;
+    const cos = Math.cos(rad);
+    const sin = Math.sin(rad);
+    const halfW = (p.width * p.scale) / 2;
+    const halfH = (p.height * p.scale) / 2;
+
+    // 변환 공식:
+    // x' = x*cos - y*sin + px
+    // y' = x*sin + y*cos + py
+    // 원본 좌표 (중심 0 기준): TL(-hw, -hh), TR(hw, -hh), BR(hw, hh), BL(-hw, hh)
+    
+    const corners = [
+        { x: -halfW, y: -halfH }, // TL
+        { x: halfW, y: -halfH },  // TR
+        { x: halfW, y: halfH },   // BR
+        { x: -halfW, y: halfH }   // BL
+    ];
+
+    return corners.map(c => ({
+        x: c.x * cos - c.y * sin + p.x,
+        y: c.x * sin + c.y * cos + p.y
+    }));
+  };
+
+  const handleMouseDown = (e) => {
+    const pos = getCanvasPos(e);
+    
+    // 1. 이미 선택된 상품이 있다면, 리사이즈 핸들 클릭 확인
+    if (selectedId) {
+        const p = products.find(prod => prod.id === selectedId);
+        if (p) {
+            const corners = getProductCorners(p);
+            // 핸들 반경 (화면상 10~15px 정도 여유)
+            const handleHitRadius = 15;
+            
+            const hitCorner = corners.find(c => {
+                const dist = Math.sqrt(Math.pow(pos.x - c.x, 2) + Math.pow(pos.y - c.y, 2));
+                return dist <= handleHitRadius;
+            });
+
+            if (hitCorner) {
+                interactionMode.current = 'resize';
+                // 리사이즈 시작 시점의 중심점~마우스 거리 저장
+                const distToCenter = Math.sqrt(Math.pow(pos.x - p.x, 2) + Math.pow(pos.y - p.y, 2));
+                initialDragData.current = {
+                    startX: pos.x,
+                    startY: pos.y,
+                    initialScale: p.scale,
+                    initialDist: distToCenter
+                };
+                return; // 리사이즈 시작했으면 함수 종료
+            }
+        }
+    }
+
+    // 2. 일반 드래그(선택) 확인
+    // Z-index 역순(위에서부터) 탐색
+    const clickedProduct = [...products].sort((a, b) => b.zIndex - a.zIndex).find(p => {
+      // 히트박스 계산 (간단히 회전 고려 없이 AABB로 체크하거나, 정확히 하려면 역변환 필요)
+      // UX상 약간 넉넉하게 AABB로 체크해도 무방
+      // 여기서는 회전된 사각형 내부 체크를 위해 중심점 거리 + 대략적 반경으로 체크 (빠른 근사)
+      // 혹은 더 정확히: 마우스 좌표를 역회전시켜서 로컬 좌표계에서 w/2, h/2 안에 있는지 확인
+      
+      const rad = -(p.rotation * Math.PI) / 180; // 역회전
+      const dx = pos.x - p.x;
+      const dy = pos.y - p.y;
+      const localX = dx * Math.cos(rad) - dy * Math.sin(rad);
+      const localY = dx * Math.sin(rad) + dy * Math.cos(rad);
+      
+      const halfW = (p.width * p.scale) / 2;
+      const halfH = (p.height * p.scale) / 2;
+      
+      return Math.abs(localX) <= halfW && Math.abs(localY) <= halfH;
+    });
+
+    if (clickedProduct) {
+      setSelectedId(clickedProduct.id);
+      interactionMode.current = 'move';
+      initialDragData.current = {
+          startX: pos.x,
+          startY: pos.y
+      };
+      
+      // 맨 앞으로 가져오기
+      const maxZ = Math.max(...products.map(p => p.zIndex), 0);
+      setProducts(prev => prev.map(p => p.id === clickedProduct.id ? { ...p, zIndex: maxZ + 1 } : p));
+    } else {
+      setSelectedId(null);
+    }
+  };
+
+  const handleMouseMove = (e) => {
+    if (!selectedId) return;
+    if (interactionMode.current === 'none') return;
+    
+    e.preventDefault();
+    const pos = getCanvasPos(e);
+
+    if (interactionMode.current === 'move') {
+        const dx = pos.x - initialDragData.current.startX;
+        const dy = pos.y - initialDragData.current.startY;
+
+        setProducts(prev => prev.map(p => {
+            if (p.id === selectedId) {
+                return { ...p, x: p.x + dx, y: p.y + dy };
+            }
+            return p;
+        }));
+        // 다음 델타 계산을 위해 현재 위치 업데이트
+        initialDragData.current.startX = pos.x;
+        initialDragData.current.startY = pos.y;
+    } 
+    else if (interactionMode.current === 'resize') {
+        // 정배율 리사이징 로직
+        // 중심점으로부터의 현재 거리 / 초기 거리 비율만큼 스케일 조절
+        const p = products.find(prod => prod.id === selectedId);
+        if (!p) return;
+
+        const currentDist = Math.sqrt(Math.pow(pos.x - p.x, 2) + Math.pow(pos.y - p.y, 2));
+        const scaleRatio = currentDist / initialDragData.current.initialDist;
+        
+        // 너무 작아지거나 커지지 않게 제한
+        let newScale = initialDragData.current.initialScale * scaleRatio;
+        newScale = Math.max(0.2, Math.min(newScale, 5.0));
+
+        setProducts(prev => prev.map(item => {
+            if (item.id === selectedId) {
+                return { ...item, scale: newScale };
+            }
+            return item;
+        }));
+    }
+  };
+
+  const handleMouseUp = () => {
+    interactionMode.current = 'none';
+  };
+
+  const updateSelected = (key, value) => {
+    if (!selectedId) return;
+    setProducts(prev => prev.map(p => {
+      if (p.id === selectedId) {
+        return { ...p, [key]: parseFloat(value) };
+      }
+      return p;
+    }));
+  };
+
+  const downloadImage = () => {
+    const canvas = canvasRef.current;
+    const link = document.createElement('a');
+    link.download = 'my-snack-box.png';
+    link.href = canvas.toDataURL();
+    link.click();
+  };
+
+  return (
+    <div className="min-h-screen bg-stone-100 flex flex-col items-center py-8 font-sans">
+      <div className="w-full max-w-6xl px-4 flex flex-col lg:flex-row gap-8">
+        
+        <div className="w-full lg:w-1/3 space-y-6">
+          <div className="bg-white p-6 rounded-3xl shadow-lg border border-stone-100">
+            <h1 className="text-2xl font-bold text-gray-800 flex items-center gap-2 mb-2">
+              <Box className="w-7 h-7 text-amber-600" />
+              스마트 박스 패킹
+            </h1>
+            <p className="text-gray-500 text-sm mb-6">
+              테두리 배경만 깔끔하게 지우고<br/>더 꽉 차게 담아보세요.
+            </p>
+
+            <div className="flex items-center justify-between bg-amber-50 p-3 rounded-xl mb-4 border border-amber-100">
+                <div className="flex items-center gap-2">
+                    <Wand2 size={18} className="text-amber-600" />
+                    <span className="text-sm font-bold text-amber-800">흰색 테두리 배경 제거</span>
+                </div>
+                <label className="relative inline-flex items-center cursor-pointer">
+                  <input type="checkbox" checked={removeBg} onChange={(e) => setRemoveBg(e.target.checked)} className="sr-only peer" />
+                  <div className="w-11 h-6 bg-gray-200 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-amber-500"></div>
+                </label>
+            </div>
+
+            <div className="bg-indigo-50 p-4 rounded-xl mb-4 border border-indigo-100">
+                <div className="flex justify-between items-center mb-2">
+                    <div className="flex items-center gap-2 text-indigo-800 font-bold">
+                        <Maximize size={18} />
+                        <span>박스 채움 비율</span>
+                    </div>
+                    <span className="text-indigo-600 font-bold bg-white px-2 py-0.5 rounded text-sm">
+                        {Math.round(fillRatio * 100)}%
+                    </span>
+                </div>
+                {/* 최대값 3.0으로 상향 */}
+                <input 
+                  type="range" min="0.8" max="3.0" step="0.1"
+                  value={fillRatio}
+                  onChange={(e) => setFillRatio(parseFloat(e.target.value))}
+                  className="w-full h-3 bg-gray-200 rounded-lg appearance-none cursor-pointer accent-indigo-600"
+                />
+                <p className="text-xs text-indigo-400 mt-2 text-center">
+                    비율을 크게 높이면 박스가 완전히 꽉 찹니다.
+                </p>
+            </div>
+
+            <div className="mb-4">
+              <label className="flex flex-col items-center justify-center w-full h-24 border-2 border-dashed border-blue-200 rounded-xl cursor-pointer hover:bg-blue-50 transition-colors group">
+                <div className="flex flex-col items-center justify-center pt-2 pb-2 group-hover:scale-105 transition-transform">
+                  <Upload className="w-6 h-6 text-blue-400 mb-1" />
+                  <p className="text-sm text-gray-600 font-bold">상품 사진 업로드</p>
+                </div>
+                <input type="file" className="hidden" multiple accept="image/*" onChange={handleImageUpload} />
+              </label>
+            </div>
+
+            <div className="mb-6 flex gap-2">
+               <div className="flex-1 relative">
+                 <div className="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none">
+                   <LinkIcon size={14} className="text-gray-400" />
+                 </div>
+                 <input 
+                   type="text"
+                   value={imageUrlInput}
+                   onChange={(e) => setImageUrlInput(e.target.value)}
+                   onKeyPress={(e) => e.key === 'Enter' && handleUrlAdd()}
+                   placeholder="이미지 URL"
+                   className="w-full pl-9 pr-3 py-2 border border-gray-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-amber-200"
+                 />
+               </div>
+               <button onClick={handleUrlAdd} className="bg-gray-100 hover:bg-gray-200 text-gray-600 px-3 py-2 rounded-lg text-sm font-medium transition">추가</button>
+            </div>
+
+            <div className="grid grid-cols-2 gap-3 mb-6">
+              <button 
+                onClick={handleAutoPack}
+                className="flex items-center justify-center gap-2 bg-white border border-gray-200 text-gray-600 px-4 py-3 rounded-xl hover:bg-gray-50 font-bold transition shadow-sm active:scale-95"
+              >
+                <RefreshCcw size={18} />
+                재배치
+              </button>
+              <button 
+                onClick={downloadImage}
+                className="flex items-center justify-center gap-2 bg-gray-800 text-white px-4 py-3 rounded-xl hover:bg-gray-900 font-bold transition shadow-lg shadow-gray-300 active:scale-95"
+              >
+                <Download size={18} />
+                저장하기
+              </button>
+            </div>
+
+            {selectedId && (
+              <div className="bg-stone-50 p-4 rounded-xl border border-stone-200 animate-in fade-in slide-in-from-bottom-2">
+                <div className="flex justify-between items-center mb-4">
+                  <span className="text-sm font-bold text-stone-700">개별 수정</span>
+                  <button onClick={deleteSelected} className="text-red-500 hover:bg-red-100 px-2 py-1 rounded text-xs font-bold flex items-center gap-1">
+                    <Trash2 size={14} /> 삭제
+                  </button>
+                </div>
+                <div className="space-y-4">
+                  <div className="space-y-1">
+                    <div className="flex justify-between text-xs font-medium text-gray-500">
+                      <span>크기 (모서리 드래그로 조절 가능)</span>
+                      <span>{products.find(p => p.id === selectedId)?.scale.toFixed(1)}x</span>
+                    </div>
+                    <input 
+                      type="range" min="0.5" max="4.0" step="0.05"
+                      value={products.find(p => p.id === selectedId)?.scale || 1}
+                      onChange={(e) => updateSelected('scale', e.target.value)}
+                      className="w-full h-2 bg-gray-200 rounded-lg appearance-none cursor-pointer accent-amber-500"
+                    />
+                  </div>
+                  <div className="space-y-1">
+                    <div className="flex justify-between text-xs font-medium text-gray-500">
+                      <span>회전</span>
+                      <span>{Math.round(products.find(p => p.id === selectedId)?.rotation || 0)}°</span>
+                    </div>
+                    <input 
+                      type="range" min="-45" max="45" step="1"
+                      value={products.find(p => p.id === selectedId)?.rotation || 0}
+                      onChange={(e) => updateSelected('rotation', e.target.value)}
+                      className="w-full h-2 bg-gray-200 rounded-lg appearance-none cursor-pointer accent-amber-500"
+                    />
+                  </div>
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+
+        <div className="w-full lg:w-2/3 flex flex-col items-center">
+            <div className="relative w-full rounded-3xl overflow-hidden shadow-2xl border-4 border-white bg-white" style={{aspectRatio: '4/3'}}>
+                <div className="absolute inset-0 bg-gradient-to-b from-blue-50 to-white"></div>
+                
+                <canvas 
+                    ref={canvasRef}
+                    width={800}
+                    height={600}
+                    onMouseDown={handleMouseDown}
+                    onMouseMove={handleMouseMove}
+                    onMouseUp={handleMouseUp}
+                    onMouseLeave={handleMouseUp}
+                    onTouchStart={handleMouseDown}
+                    onTouchMove={handleMouseMove}
+                    onTouchEnd={handleMouseUp}
+                    className="w-full h-full relative z-10 cursor-move touch-none object-contain"
+                />
+                
+                {products.length === 0 && (
+                    <div className="absolute inset-0 flex items-center justify-center pointer-events-none z-20">
+                    <div className="text-center opacity-40">
+                        <ImageIcon className="w-20 h-20 mx-auto mb-4 text-gray-400" />
+                        <h3 className="text-2xl font-bold text-gray-400">여기에 박스가 나타납니다</h3>
+                        <p className="text-gray-400 mt-2">상품 이미지를 추가해보세요.</p>
+                    </div>
+                    </div>
+                )}
+            </div>
+        </div>
+
+      </div>
+    </div>
+  );
+};
+
+export default App;

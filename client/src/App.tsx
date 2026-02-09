@@ -12,6 +12,7 @@ import ValidatePage from "@/pages/validate";
 import ExportPage from "@/pages/export";
 import SettingsPage from "@/pages/settings";
 import BoxPackingPage from "@/pages/tools-box-packing";
+import SmartBoxPage from "@/pages/tools-smart-box";
 import DetailBuilderPage from "@/pages/tools-detail-builder";
 import FeatureCrawlerPage from "@/pages/feature-crawler";
 import FeaturePriceEditorPage from "@/pages/feature-price-editor";
@@ -31,6 +32,7 @@ function Router() {
       <Route path="/export" component={ExportPage} />
       <Route path="/settings" component={SettingsPage} />
       <Route path="/tools/box-packing" component={BoxPackingPage} />
+      <Route path="/tools/smart-box" component={SmartBoxPage} />
       <Route path="/tools/detail-builder" component={DetailBuilderPage} />
       <Route path="/features/crawler" component={FeatureCrawlerPage} />
       <Route path="/features/price-editor" component={FeaturePriceEditorPage} />
