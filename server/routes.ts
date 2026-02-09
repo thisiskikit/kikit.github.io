@@ -1,16 +1,398 @@
 import type { Express } from "express";
 import { createServer, type Server } from "http";
 import { storage } from "./storage";
+import { getMockProducts, getMockProductById } from "./mock-data";
+import type { CoupangProduct, ValidationResult } from "@shared/schema";
+import ExcelJS from "exceljs";
 
 export async function registerRoutes(
   httpServer: Server,
   app: Express
 ): Promise<Server> {
-  // put application routes here
-  // prefix all routes with /api
 
-  // use storage to perform CRUD operations on the storage interface
-  // e.g. storage.insertUser(user) or storage.getUserByUsername(username)
+  // ========================
+  // A) Products (BigQuery / Mock)
+  // ========================
+  app.get("/api/coupang/products", async (req, res) => {
+    try {
+      const limit = Math.min(parseInt(req.query.limit as string) || 20, 100);
+      const offset = parseInt(req.query.offset as string) || 0;
+      const q = (req.query.q as string || "").toLowerCase();
+      const statusFilter = req.query.status as string;
+
+      let products = getMockProducts();
+
+      if (q) {
+        products = products.filter(p =>
+          p.product_name.toLowerCase().includes(q) ||
+          p.seller_product_code.toLowerCase().includes(q) ||
+          p.product_id.toLowerCase().includes(q) ||
+          p.brand.toLowerCase().includes(q)
+        );
+      }
+
+      if (statusFilter) {
+        products = products.filter(p => p.status === statusFilter);
+      }
+
+      const total = products.length;
+      const items = products.slice(offset, offset + limit);
+
+      res.json({ items, total });
+    } catch (err: any) {
+      res.status(500).json({ message: err.message });
+    }
+  });
+
+  // ========================
+  // B) Draft / Patch
+  // ========================
+  app.post("/api/draft/session", async (req, res) => {
+    try {
+      const { note, created_by } = req.body;
+      const session = await storage.createDraftSession({
+        note: note || null,
+        createdBy: created_by || "system",
+      });
+      res.json({ sessionId: session.id });
+    } catch (err: any) {
+      res.status(500).json({ message: err.message });
+    }
+  });
+
+  app.get("/api/draft/sessions", async (_req, res) => {
+    try {
+      const sessions = await storage.getDraftSessions();
+      res.json(sessions);
+    } catch (err: any) {
+      res.status(500).json({ message: err.message });
+    }
+  });
+
+  app.get("/api/draft/session/:id", async (req, res) => {
+    try {
+      const items = await storage.getDraftItems(req.params.id);
+      const enriched = items.map(item => {
+        const product = getMockProductById(item.productId);
+        return { ...item, product };
+      });
+      res.json(enriched);
+    } catch (err: any) {
+      res.status(500).json({ message: err.message });
+    }
+  });
+
+  app.patch("/api/draft/apply", async (req, res) => {
+    try {
+      const { sessionId, productId, patch, actor } = req.body;
+      if (!sessionId || !productId) {
+        return res.status(400).json({ message: "sessionId and productId required" });
+      }
+
+      const existingItems = await storage.getDraftItems(sessionId);
+      const existingItem = existingItems.find(i => i.productId === productId);
+      const oldPatch = (existingItem?.patchJson || {}) as Record<string, any>;
+
+      const item = await storage.upsertDraftItem(sessionId, productId, patch || {});
+
+      const product = getMockProductById(productId);
+      for (const [field, newValue] of Object.entries(patch || {})) {
+        const oldValue = oldPatch[field] !== undefined ? oldPatch[field] : (product ? (product as any)[field] : null);
+        if (String(oldValue) !== String(newValue)) {
+          await storage.createEditLog({
+            actor: actor || "system",
+            source: "ui",
+            sessionId,
+            productId,
+            field,
+            oldValue: oldValue != null ? String(oldValue) : null,
+            newValue: newValue != null ? String(newValue) : null,
+          });
+        }
+      }
+
+      res.json(item);
+    } catch (err: any) {
+      res.status(500).json({ message: err.message });
+    }
+  });
+
+  app.post("/api/draft/rollback", async (req, res) => {
+    try {
+      const { sessionId } = req.body;
+      if (!sessionId) return res.status(400).json({ message: "sessionId required" });
+
+      await storage.deleteDraftItemsBySession(sessionId);
+
+      await storage.createEditLog({
+        actor: "system",
+        source: "ui",
+        sessionId,
+        productId: "*",
+        field: "rollback",
+        oldValue: null,
+        newValue: "session_rollback",
+      });
+
+      res.json({ success: true });
+    } catch (err: any) {
+      res.status(500).json({ message: err.message });
+    }
+  });
+
+  // ========================
+  // C) Validate
+  // ========================
+  app.post("/api/validate", async (req, res) => {
+    try {
+      const { sessionId } = req.body;
+      if (!sessionId) return res.status(400).json({ message: "sessionId required" });
+
+      const items = await storage.getDraftItems(sessionId);
+      const errors: ValidationResult["errors"] = [];
+      const warnings: ValidationResult["warnings"] = [];
+
+      for (const item of items) {
+        const product = getMockProductById(item.productId);
+        const patch = (item.patchJson || {}) as Record<string, any>;
+        const merged = { ...product, ...patch } as any;
+
+        if (!merged.product_name || merged.product_name.trim() === "") {
+          errors.push({ productId: item.productId, field: "product_name", message: "상품명이 비어있습니다." });
+        }
+
+        const price = Number(merged.price);
+        if (isNaN(price) || price <= 0) {
+          errors.push({ productId: item.productId, field: "price", message: "가격은 0보다 커야 합니다." });
+        }
+
+        const salePrice = Number(merged.sale_price);
+        if (!isNaN(salePrice) && salePrice > 0 && salePrice > price) {
+          warnings.push({ productId: item.productId, field: "sale_price", message: "할인가가 판매가보다 높습니다." });
+        }
+
+        if (merged.product_name && merged.product_name.length > 100) {
+          warnings.push({ productId: item.productId, field: "product_name", message: `상품명이 ${merged.product_name.length}자입니다. (권장: 100자 이하)` });
+        }
+      }
+
+      const canExport = errors.length === 0;
+      res.json({ errors, warnings, canExport });
+    } catch (err: any) {
+      res.status(500).json({ message: err.message });
+    }
+  });
+
+  // ========================
+  // D) Export xlsx
+  // ========================
+  app.post("/api/export/xlsx", async (req, res) => {
+    try {
+      const { sessionId } = req.body;
+      if (!sessionId) return res.status(400).json({ message: "sessionId required" });
+
+      const items = await storage.getDraftItems(sessionId);
+
+      const errors: ValidationResult["errors"] = [];
+      for (const item of items) {
+        const product = getMockProductById(item.productId);
+        const patch = (item.patchJson || {}) as Record<string, any>;
+        const merged = { ...product, ...patch } as any;
+        if (!merged.product_name || merged.product_name.trim() === "") {
+          errors.push({ productId: item.productId, field: "product_name", message: "상품명 누락" });
+        }
+        const price = Number(merged.price);
+        if (isNaN(price) || price <= 0) {
+          errors.push({ productId: item.productId, field: "price", message: "가격 오류" });
+        }
+      }
+
+      if (errors.length > 0) {
+        return res.status(400).json({ message: "검증 에러가 있어 Export할 수 없습니다. 먼저 검증 페이지에서 에러를 해결하세요.", errors });
+      }
+
+      const workbook = new ExcelJS.Workbook();
+      const sheet = workbook.addWorksheet("상품 데이터");
+
+      sheet.columns = [
+        { header: "상품ID", key: "product_id", width: 18 },
+        { header: "셀러상품코드", key: "seller_product_code", width: 15 },
+        { header: "상품명", key: "product_name", width: 35 },
+        { header: "옵션", key: "option_text", width: 15 },
+        { header: "판매가", key: "price", width: 12 },
+        { header: "할인가", key: "sale_price", width: 12 },
+        { header: "상태", key: "status", width: 10 },
+        { header: "카테고리ID", key: "category_id", width: 12 },
+        { header: "메인이미지", key: "images_main", width: 40 },
+        { header: "서브이미지", key: "images_sub", width: 40 },
+        { header: "메모", key: "memo", width: 20 },
+      ];
+
+      const headerRow = sheet.getRow(1);
+      headerRow.font = { bold: true };
+      headerRow.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FF4472C4" } };
+      headerRow.font = { bold: true, color: { argb: "FFFFFFFF" } };
+
+      for (const item of items) {
+        const product = getMockProductById(item.productId);
+        const patch = (item.patchJson || {}) as Record<string, any>;
+        const merged = { ...product, ...patch };
+        sheet.addRow(merged);
+      }
+
+      res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+      res.setHeader("Content-Disposition", `attachment; filename=kikit-export-${new Date().toISOString().slice(0, 10)}.xlsx`);
+
+      await workbook.xlsx.write(res);
+      res.end();
+    } catch (err: any) {
+      res.status(500).json({ message: err.message });
+    }
+  });
+
+  // ========================
+  // E) Jobs (공통)
+  // ========================
+  app.post("/api/jobs", async (req, res) => {
+    try {
+      const { type, payload, created_by } = req.body;
+      const job = await storage.createJob({
+        type,
+        status: "queued",
+        payloadJson: payload || {},
+        createdBy: created_by || "system",
+      });
+      res.json(job);
+    } catch (err: any) {
+      res.status(500).json({ message: err.message });
+    }
+  });
+
+  app.get("/api/jobs/:id", async (req, res) => {
+    try {
+      const job = await storage.getJob(req.params.id);
+      if (!job) return res.status(404).json({ message: "Job not found" });
+      res.json(job);
+    } catch (err: any) {
+      res.status(500).json({ message: err.message });
+    }
+  });
+
+  app.get("/api/jobs", async (req, res) => {
+    try {
+      const jobs = await storage.getJobs({
+        type: req.query.type as string,
+        status: req.query.status as string,
+        limit: parseInt(req.query.limit as string) || 20,
+        offset: parseInt(req.query.offset as string) || 0,
+      });
+      res.json(jobs);
+    } catch (err: any) {
+      res.status(500).json({ message: err.message });
+    }
+  });
+
+  // ========================
+  // F) Feature APIs (stubs)
+  // ========================
+  app.post("/api/crawl", async (req, res) => {
+    try {
+      const { url, created_by } = req.body;
+      const job = await storage.createJob({
+        type: "CRAWL_URL",
+        status: "queued",
+        payloadJson: { url },
+        createdBy: created_by || "system",
+      });
+      res.json({ jobId: job.id, status: "queued" });
+    } catch (err: any) {
+      res.status(500).json({ message: err.message });
+    }
+  });
+
+  app.post("/api/price/edit", async (req, res) => {
+    try {
+      const { items: editItems, created_by } = req.body;
+      const job = await storage.createJob({
+        type: "EDIT_PRICE",
+        status: "queued",
+        payloadJson: { items: editItems },
+        createdBy: created_by || "system",
+      });
+      res.json({ jobId: job.id, status: "queued" });
+    } catch (err: any) {
+      res.status(500).json({ message: err.message });
+    }
+  });
+
+  app.post("/api/images/translate", async (req, res) => {
+    try {
+      const { imageId, imageUrl, targetLang, created_by } = req.body;
+      const job = await storage.createJob({
+        type: "IMAGE_TRANSLATE",
+        status: "queued",
+        payloadJson: { imageId, imageUrl, targetLang: targetLang || "ko" },
+        createdBy: created_by || "system",
+      });
+      res.json({ jobId: job.id, status: "queued" });
+    } catch (err: any) {
+      res.status(500).json({ message: err.message });
+    }
+  });
+
+  app.post("/api/images/cutout", async (req, res) => {
+    try {
+      const { imageId, imageUrl, mask, created_by } = req.body;
+      const job = await storage.createJob({
+        type: "IMAGE_CUTOUT",
+        status: "queued",
+        payloadJson: { imageId, imageUrl, mask },
+        createdBy: created_by || "system",
+      });
+      res.json({ jobId: job.id, status: "queued" });
+    } catch (err: any) {
+      res.status(500).json({ message: err.message });
+    }
+  });
+
+  // G) Image hosting stubs
+  app.post("/api/images/upload", async (_req, res) => {
+    // TODO: 실제 서버 경로 D:\Dev\hosting\uploads
+    res.json({ storedUrl: "https://img.aboutfactory.co.kr/mock/uploaded-image.jpg", message: "Mock upload (stub)" });
+  });
+
+  app.get("/api/images/list", async (_req, res) => {
+    res.json([
+      { url: "https://img.aboutfactory.co.kr/mock/sample1.jpg", name: "sample1.jpg" },
+      { url: "https://img.aboutfactory.co.kr/mock/sample2.jpg", name: "sample2.jpg" },
+    ]);
+  });
+
+  // SKU search
+  app.get("/api/sku/search", async (req, res) => {
+    try {
+      const q = req.query.q as string || "";
+      const results = await storage.searchSku(q);
+      res.json(results);
+    } catch (err: any) {
+      res.status(500).json({ message: err.message });
+    }
+  });
+
+  // Settings status
+  app.get("/api/settings/status", async (_req, res) => {
+    const mockMode = process.env.MOCK_MODE === "true";
+    let pgConnected = false;
+    try {
+      await storage.getDraftSessions();
+      pgConnected = true;
+    } catch { }
+    res.json({
+      mockMode,
+      pgConnected,
+      bqConnected: false,
+    });
+  });
 
   return httpServer;
 }

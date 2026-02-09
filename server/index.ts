@@ -2,6 +2,7 @@ import express, { type Request, Response, NextFunction } from "express";
 import { registerRoutes } from "./routes";
 import { serveStatic } from "./static";
 import { createServer } from "http";
+import { storage } from "./storage";
 
 const app = express();
 const httpServer = createServer(app);
@@ -60,6 +61,13 @@ app.use((req, res, next) => {
 });
 
 (async () => {
+  try {
+    await storage.seedData();
+    log("Seed data initialized");
+  } catch (err) {
+    log("Seed data skipped or error: " + (err as Error).message);
+  }
+
   await registerRoutes(httpServer, app);
 
   app.use((err: any, _req: Request, res: Response, next: NextFunction) => {
