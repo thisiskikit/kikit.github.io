@@ -15,6 +15,37 @@ import {
 const pool = new pg.Pool({ connectionString: process.env.DATABASE_URL });
 export const db = drizzle(pool);
 
+const fallbackSkuMaster: SkuMaster[] = [
+  { id: "mock-kk-00001", sku: "KK-00001", productName: "Stainless Bottle 500ml", brand: "KIKIT HOME", category: "Kitchen", memo: "best seller" },
+  { id: "mock-kk-00002", sku: "KK-00002", productName: "Silicone Kitchen Mat Large", brand: "KIKIT HOME", category: "Kitchen", memo: "" },
+  { id: "mock-kk-00003", sku: "KK-00003", productName: "Wood Cutting Board Anti-bacterial", brand: "PREMIUM HOUSE", category: "Kitchen", memo: "new" },
+  { id: "mock-kk-00004", sku: "KK-00004", productName: "Wireless LED Mood Lamp", brand: "SMART LIVING", category: "Interior", memo: "" },
+  { id: "mock-kk-00005", sku: "KK-00005", productName: "Foldable Drying Rack 3 Tier", brand: "ECO LIFE", category: "Living", memo: "seasonal" },
+  { id: "mock-kk-00006", sku: "KK-00006", productName: "Premium Microfiber Towel Set", brand: "MODERN STYLE", category: "Bath", memo: "" },
+  { id: "mock-kk-00007", sku: "KK-00007", productName: "Auto Sensor Trash Bin 12L", brand: "SMART LIVING", category: "Living", memo: "" },
+  { id: "mock-kk-00008", sku: "KK-00008", productName: "Cordless Handy Vacuum", brand: "DAILY GOODS", category: "Electronics", memo: "popular" },
+];
+
+const normalizeSkuTerms = (q: string) => q.trim().replace(/\s+/g, " ").split(" ").filter(Boolean);
+
+const filterFallbackSku = (q: string) => {
+  const terms = normalizeSkuTerms(q).map((term) => term.toLowerCase());
+  if (terms.length === 0) return [];
+
+  return fallbackSkuMaster
+    .filter((row) => {
+      const haystack = [
+        row.sku,
+        row.productName,
+        row.brand || "",
+        row.category || "",
+        row.memo || "",
+      ].join(" ").toLowerCase();
+      return terms.every((term) => haystack.includes(term));
+    })
+    .slice(0, 50);
+};
+
 export interface IStorage {
   createDraftSession(data: InsertDraftSession): Promise<DraftSession>;
   getDraftSessions(): Promise<DraftSession[]>;
@@ -121,9 +152,13 @@ export class DatabaseStorage implements IStorage {
       );
     });
 
-    return db.select().from(skuMaster)
-      .where(and(...termConditions))
-      .limit(50);
+    try {
+      return await db.select().from(skuMaster)
+        .where(and(...termConditions))
+        .limit(50);
+    } catch {
+      return filterFallbackSku(normalizedQuery);
+    }
   }
 
   async seedData(): Promise<void> {

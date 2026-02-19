@@ -2,8 +2,69 @@ import type { Express } from "express";
 import { createServer, type Server } from "http";
 import { storage } from "./storage";
 import { getMockProducts, getMockProductById } from "./mock-data";
-import type { CoupangProduct, ValidationResult } from "@shared/schema";
+import type { CoupangProduct, SkuMaster, ValidationResult } from "@shared/schema";
+import { parseCompositionWithLlm, type AiCompositionItem } from "./ai-composition";
 import ExcelJS from "exceljs";
+
+type CompositionMatch = SkuMaster & { matchScore: number };
+type CompositionItemResult = {
+  item: AiCompositionItem;
+  queries: string[];
+  matches: CompositionMatch[];
+};
+
+const uniqueStrings = (values: string[]) => {
+  const seen = new Set<string>();
+  const result: string[] = [];
+  for (const value of values) {
+    const key = value.trim();
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    result.push(key);
+  }
+  return result;
+};
+
+const parseFallbackComposition = (inputText: string): AiCompositionItem[] => {
+  const chunks = inputText
+    .split(/\r?\n|,|;|\//g)
+    .map((part) => part.trim())
+    .filter(Boolean);
+
+  const seeds = chunks.length > 0 ? chunks : [inputText.trim()];
+  return seeds.slice(0, 20).map((raw) => {
+    const qtyMatch = raw.match(/^(.*?)(?:\s*(?:x|X|\*)\s*(\d{1,2}))$/);
+    const name = (qtyMatch?.[1] || raw).trim();
+    const quantityRaw = Number(qtyMatch?.[2] || 1);
+    const quantity = Number.isFinite(quantityRaw) ? Math.max(1, Math.min(99, Math.floor(quantityRaw))) : 1;
+    return {
+      name,
+      quantity,
+      packHint: null,
+      tasteHint: null,
+      aliases: [],
+      confidence: null,
+    } satisfies AiCompositionItem;
+  }).filter((item) => item.name.length > 0);
+};
+
+const scoreSku = (sku: SkuMaster, query: string, primary: boolean) => {
+  const needle = query.toLowerCase();
+  const skuCode = String(sku.sku || "").toLowerCase();
+  const productName = String(sku.productName || "").toLowerCase();
+  const brand = String(sku.brand || "").toLowerCase();
+  const category = String(sku.category || "").toLowerCase();
+  const memo = String(sku.memo || "").toLowerCase();
+
+  let score = primary ? 30 : 15;
+  if (skuCode === needle) score += 60;
+  if (skuCode.includes(needle)) score += 25;
+  if (productName.includes(needle)) score += 20;
+  if (brand.includes(needle)) score += 10;
+  if (category.includes(needle)) score += 8;
+  if (memo.includes(needle)) score += 5;
+  return score;
+};
 
 export async function registerRoutes(
   httpServer: Server,
@@ -369,6 +430,68 @@ export async function registerRoutes(
   });
 
   // SKU search
+  app.post("/api/sku/compose-search", async (req, res) => {
+    try {
+      const inputText = String(req.body?.text ?? "").trim();
+      if (!inputText) {
+        return res.status(400).json({ message: "text is required" });
+      }
+
+      const rawLimit = Number(req.body?.limitPerItem ?? 8);
+      const limitPerItem = Number.isFinite(rawLimit)
+        ? Math.max(1, Math.min(20, Math.floor(rawLimit)))
+        : 8;
+
+      const llm = await parseCompositionWithLlm(inputText);
+      const itemsToMatch = llm.used && llm.items.length > 0
+        ? llm.items
+        : parseFallbackComposition(inputText);
+
+      const itemResults: CompositionItemResult[] = [];
+      for (const item of itemsToMatch) {
+        const queries = uniqueStrings([item.name, ...item.aliases]).slice(0, 5);
+        const safeQueries = queries.length > 0 ? queries : [item.name];
+        const ranked = new Map<string, { sku: SkuMaster; score: number }>();
+
+        for (let i = 0; i < safeQueries.length; i += 1) {
+          const query = safeQueries[i];
+          if (query.length < 2) continue;
+          const rows = await storage.searchSku(query);
+          rows.forEach((row) => {
+            const key = row.id || row.sku;
+            const delta = scoreSku(row, query, i === 0);
+            const existing = ranked.get(key);
+            if (existing) {
+              existing.score += delta;
+            } else {
+              ranked.set(key, { sku: row, score: delta });
+            }
+          });
+        }
+
+        const matches: CompositionMatch[] = Array.from(ranked.values())
+          .sort((a, b) => b.score - a.score)
+          .slice(0, limitPerItem)
+          .map((entry) => ({ ...entry.sku, matchScore: entry.score }));
+
+        itemResults.push({
+          item,
+          queries: safeQueries,
+          matches,
+        });
+      }
+
+      return res.json({
+        input: inputText,
+        llm,
+        itemResults,
+        totalMatches: itemResults.reduce((sum, item) => sum + item.matches.length, 0),
+      });
+    } catch (err: any) {
+      return res.status(500).json({ message: err?.message || "compose-search failed" });
+    }
+  });
+
   app.get("/api/sku/search", async (req, res) => {
     try {
       const q = String(req.query.q ?? "").trim();
