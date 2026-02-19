@@ -371,7 +371,8 @@ export async function registerRoutes(
   // SKU search
   app.get("/api/sku/search", async (req, res) => {
     try {
-      const q = req.query.q as string || "";
+      const q = String(req.query.q ?? "").trim();
+      if (!q) return res.json([]);
       const results = await storage.searchSku(q);
       res.json(results);
     } catch (err: any) {

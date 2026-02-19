@@ -1,4 +1,4 @@
-import { eq, and, or, ilike, desc, sql } from "drizzle-orm";
+import { eq, and, or, ilike, desc } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/node-postgres";
 import pg from "pg";
 import {
@@ -106,17 +106,23 @@ export class DatabaseStorage implements IStorage {
   }
 
   async searchSku(q: string): Promise<SkuMaster[]> {
-    if (!q) return [];
-    const pattern = `%${q}%`;
+    const normalizedQuery = q.trim().replace(/\s+/g, " ");
+    if (!normalizedQuery) return [];
+
+    const terms = normalizedQuery.split(" ");
+    const termConditions = terms.map(term => {
+      const pattern = `%${term}%`;
+      return or(
+        ilike(skuMaster.sku, pattern),
+        ilike(skuMaster.productName, pattern),
+        ilike(skuMaster.brand, pattern),
+        ilike(skuMaster.category, pattern),
+        ilike(skuMaster.memo, pattern),
+      );
+    });
+
     return db.select().from(skuMaster)
-      .where(
-        or(
-          ilike(skuMaster.sku, pattern),
-          ilike(skuMaster.productName, pattern),
-          ilike(skuMaster.brand, pattern),
-          ilike(skuMaster.category, pattern),
-        )
-      )
+      .where(and(...termConditions))
       .limit(50);
   }
 

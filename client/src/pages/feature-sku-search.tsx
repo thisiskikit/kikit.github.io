@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
+import { apiRequest } from "@/lib/queryClient";
 import { PageHeader } from "@/components/page-header";
-import { HelpTip } from "@/components/help-tip";
 import { Input } from "@/components/ui/input";
 import { Card, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
@@ -11,10 +11,17 @@ import type { SkuMaster } from "@shared/schema";
 
 export default function FeatureSkuSearchPage() {
   const [query, setQuery] = useState("");
+  const normalizedQuery = query.trim();
 
   const { data: results, isLoading } = useQuery<SkuMaster[]>({
-    queryKey: ["/api/sku/search", `?q=${encodeURIComponent(query)}`],
-    enabled: query.length >= 1,
+    queryKey: ["/api/sku/search", normalizedQuery],
+    enabled: normalizedQuery.length > 0,
+    queryFn: async ({ queryKey }) => {
+      const [, keyword] = queryKey as [string, string];
+      const params = new URLSearchParams({ q: keyword });
+      const res = await apiRequest("GET", `/api/sku/search?${params.toString()}`);
+      return await res.json();
+    },
   });
 
   return (
@@ -51,12 +58,12 @@ export default function FeatureSkuSearchPage() {
         </div>
       )}
 
-      {results && results.length === 0 && query.length > 0 && (
+      {results && results.length === 0 && normalizedQuery.length > 0 && (
         <Card>
           <CardContent className="pt-6">
             <div className="flex flex-col items-center justify-center py-8 text-center">
               <Package className="w-10 h-10 mb-3 opacity-30 text-muted-foreground" />
-              <p className="text-sm text-muted-foreground">"{query}"에 해당하는 SKU가 없습니다.</p>
+              <p className="text-sm text-muted-foreground">"{normalizedQuery}"에 해당하는 SKU가 없습니다.</p>
             </div>
           </CardContent>
         </Card>
