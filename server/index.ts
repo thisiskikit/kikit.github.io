@@ -1,8 +1,10 @@
 import express, { type Request, Response, NextFunction } from "express";
+import path from "path";
 import { registerRoutes } from "./routes";
 import { serveStatic } from "./static";
 import { createServer } from "http";
 import { storage } from "./storage";
+import { resumeQueuedJobs } from "./jobs";
 
 const app = express();
 const httpServer = createServer(app);
@@ -22,6 +24,7 @@ app.use(
 );
 
 app.use(express.urlencoded({ extended: false }));
+app.use("/uploads", express.static(path.resolve(process.cwd(), "attached_assets", "uploads")));
 
 export function log(message: string, source = "express") {
   const formattedTime = new Date().toLocaleTimeString("en-US", {
@@ -69,6 +72,11 @@ app.use((req, res, next) => {
   }
 
   await registerRoutes(httpServer, app);
+  try {
+    await resumeQueuedJobs();
+  } catch (err) {
+    log("Resume queued jobs skipped or error: " + (err as Error).message);
+  }
 
   app.use((err: any, _req: Request, res: Response, next: NextFunction) => {
     const status = err.status || err.statusCode || 500;

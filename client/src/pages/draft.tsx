@@ -67,7 +67,7 @@ export default function DraftPage() {
 
   const bulkApply = useMutation({
     mutationFn: async () => {
-      for (const pid of bulkSelected) {
+      for (const pid of Array.from(bulkSelected)) {
         await apiRequest("PATCH", "/api/draft/apply", {
           sessionId,
           productId: pid,
@@ -185,7 +185,7 @@ export default function DraftPage() {
               </p>
             ) : (
               filteredItems.map(item => {
-                const hasPatch = item.patchJson && Object.keys(item.patchJson as Record<string, any>).length > 0;
+                const hasPatch = Boolean(item.patchJson && Object.keys(item.patchJson as Record<string, any>).length > 0);
                 return (
                   <div
                     key={item.id}

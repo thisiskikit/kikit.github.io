@@ -37,7 +37,7 @@ export default function ProductsPage() {
     mutationFn: async () => {
       const sessionRes = await apiRequest("POST", "/api/draft/session", { note: "상품 목록에서 추가", created_by: "ui-user" });
       const session = await sessionRes.json();
-      for (const pid of selected) {
+      for (const pid of Array.from(selected)) {
         await apiRequest("PATCH", "/api/draft/apply", {
           sessionId: session.sessionId,
           productId: pid,

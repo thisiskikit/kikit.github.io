@@ -1,8 +1,10 @@
+import { randomUUID } from "crypto";
 import { eq, and, or, ilike, desc } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/node-postgres";
 import pg from "pg";
 import {
   draftSessions, draftItems, opsEditLogs, opsJobs,
+  assetImages, assetDerivatives,
   skuMaster, categoryMap,
   type DraftSession, type InsertDraftSession,
   type DraftItem, type InsertDraftItem,
@@ -46,6 +48,12 @@ const filterFallbackSku = (q: string) => {
     .slice(0, 50);
 };
 
+type AssetImage = typeof assetImages.$inferSelect;
+type AssetImageInsert = Omit<typeof assetImages.$inferInsert, "id" | "createdAt">;
+type AssetDerivative = typeof assetDerivatives.$inferSelect;
+type AssetDerivativeInsert = Omit<typeof assetDerivatives.$inferInsert, "id" | "createdAt">;
+type UpdateOpsJobPatch = Partial<Pick<OpsJob, "status" | "payloadJson" | "resultJson" | "errorText" | "startedAt" | "finishedAt">>;
+
 export interface IStorage {
   createDraftSession(data: InsertDraftSession): Promise<DraftSession>;
   getDraftSessions(): Promise<DraftSession[]>;
@@ -57,11 +65,21 @@ export interface IStorage {
   createJob(data: InsertOpsJob): Promise<OpsJob>;
   getJob(id: string): Promise<OpsJob | undefined>;
   getJobs(filters: { type?: string; status?: string; limit?: number; offset?: number }): Promise<OpsJob[]>;
+  updateJob(id: string, patch: UpdateOpsJobPatch): Promise<OpsJob | undefined>;
+  createAssetImage(data: AssetImageInsert): Promise<AssetImage>;
+  getAssetImage(id: string): Promise<AssetImage | undefined>;
+  listAssetImages(filters: { q?: string; limit?: number }): Promise<AssetImage[]>;
+  createAssetDerivative(data: AssetDerivativeInsert): Promise<AssetDerivative>;
+  listAssetDerivatives(imageId: string, kind?: string): Promise<AssetDerivative[]>;
   searchSku(q: string): Promise<SkuMaster[]>;
   seedData(): Promise<void>;
 }
 
 export class DatabaseStorage implements IStorage {
+  private memoryJobs: OpsJob[] = [];
+  private memoryImages: AssetImage[] = [];
+  private memoryDerivatives: AssetDerivative[] = [];
+
   async createDraftSession(data: InsertDraftSession): Promise<DraftSession> {
     const [session] = await db.insert(draftSessions).values(data).returning();
     return session;
@@ -111,29 +129,199 @@ export class DatabaseStorage implements IStorage {
   }
 
   async createJob(data: InsertOpsJob): Promise<OpsJob> {
-    const [job] = await db.insert(opsJobs).values(data).returning();
-    return job;
+    try {
+      const [job] = await db.insert(opsJobs).values(data).returning();
+      return job;
+    } catch {
+      const now = new Date();
+      const job: OpsJob = {
+        id: randomUUID(),
+        type: data.type,
+        status: data.status || "queued",
+        payloadJson: data.payloadJson || {},
+        resultJson: null,
+        errorText: null,
+        createdAt: now,
+        startedAt: null,
+        finishedAt: null,
+        createdBy: data.createdBy || "system",
+      };
+      this.memoryJobs.unshift(job);
+      return job;
+    }
   }
 
   async getJob(id: string): Promise<OpsJob | undefined> {
-    const [job] = await db.select().from(opsJobs).where(eq(opsJobs.id, id));
-    return job;
+    try {
+      const [job] = await db.select().from(opsJobs).where(eq(opsJobs.id, id));
+      if (job) return job;
+    } catch {
+      // Fallback handled below.
+    }
+    return this.memoryJobs.find((job) => job.id === id);
   }
 
   async getJobs(filters: { type?: string; status?: string; limit?: number; offset?: number }): Promise<OpsJob[]> {
-    let query = db.select().from(opsJobs);
-    const conditions = [];
-    if (filters.type) conditions.push(eq(opsJobs.type, filters.type));
-    if (filters.status) conditions.push(eq(opsJobs.status, filters.status));
+    try {
+      let query = db.select().from(opsJobs);
+      const conditions = [];
+      if (filters.type) conditions.push(eq(opsJobs.type, filters.type));
+      if (filters.status) conditions.push(eq(opsJobs.status, filters.status));
 
-    if (conditions.length > 0) {
-      query = query.where(and(...conditions)) as any;
+      if (conditions.length > 0) {
+        query = query.where(and(...conditions)) as any;
+      }
+
+      return await query
+        .orderBy(desc(opsJobs.createdAt))
+        .limit(filters.limit || 20)
+        .offset(filters.offset || 0);
+    } catch {
+      const limit = filters.limit || 20;
+      const offset = filters.offset || 0;
+      const filtered = this.memoryJobs
+        .filter((job) => {
+          if (filters.type && job.type !== filters.type) return false;
+          if (filters.status && job.status !== filters.status) return false;
+          return true;
+        })
+        .sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime());
+      return filtered.slice(offset, offset + limit);
+    }
+  }
+
+  async updateJob(id: string, patch: UpdateOpsJobPatch): Promise<OpsJob | undefined> {
+    const updatePayload = {
+      ...(patch.status !== undefined ? { status: patch.status } : {}),
+      ...(patch.payloadJson !== undefined ? { payloadJson: patch.payloadJson } : {}),
+      ...(patch.resultJson !== undefined ? { resultJson: patch.resultJson } : {}),
+      ...(patch.errorText !== undefined ? { errorText: patch.errorText } : {}),
+      ...(patch.startedAt !== undefined ? { startedAt: patch.startedAt } : {}),
+      ...(patch.finishedAt !== undefined ? { finishedAt: patch.finishedAt } : {}),
+    };
+
+    try {
+      const [updated] = await db.update(opsJobs).set(updatePayload).where(eq(opsJobs.id, id)).returning();
+      if (updated) return updated;
+    } catch {
+      // Fallback handled below.
     }
 
-    return query
-      .orderBy(desc(opsJobs.createdAt))
-      .limit(filters.limit || 20)
-      .offset(filters.offset || 0);
+    const index = this.memoryJobs.findIndex((job) => job.id === id);
+    if (index < 0) return undefined;
+    const updatedJob: OpsJob = { ...this.memoryJobs[index], ...patch };
+    this.memoryJobs[index] = updatedJob;
+    return updatedJob;
+  }
+
+  async createAssetImage(data: AssetImageInsert): Promise<AssetImage> {
+    try {
+      const [row] = await db.insert(assetImages).values(data).returning();
+      return row;
+    } catch {
+      const row: AssetImage = {
+        id: randomUUID(),
+        sourceType: data.sourceType || "upload",
+        sourceUrl: data.sourceUrl ?? null,
+        storedUrl: data.storedUrl ?? null,
+        width: data.width ?? null,
+        height: data.height ?? null,
+        mime: data.mime ?? null,
+        metaJson: (data.metaJson as Record<string, any> | null | undefined) ?? {},
+        createdAt: new Date(),
+      };
+      this.memoryImages.unshift(row);
+      return row;
+    }
+  }
+
+  async getAssetImage(id: string): Promise<AssetImage | undefined> {
+    try {
+      const [row] = await db.select().from(assetImages).where(eq(assetImages.id, id));
+      if (row) return row;
+    } catch {
+      // Fallback handled below.
+    }
+    return this.memoryImages.find((row) => row.id === id);
+  }
+
+  async listAssetImages(filters: { q?: string; limit?: number }): Promise<AssetImage[]> {
+    const q = String(filters.q || "").trim();
+    const limit = Math.max(1, Math.min(200, filters.limit || 50));
+
+    try {
+      let query = db.select().from(assetImages);
+      if (q) {
+        const pattern = `%${q}%`;
+        query = query.where(
+          or(
+            ilike(assetImages.sourceUrl, pattern),
+            ilike(assetImages.storedUrl, pattern),
+            ilike(assetImages.mime, pattern),
+          )
+        ) as any;
+      }
+
+      return await query
+        .orderBy(desc(assetImages.createdAt))
+        .limit(limit);
+    } catch {
+      const needle = q.toLowerCase();
+      const filtered = this.memoryImages.filter((row) => {
+        if (!needle) return true;
+        const haystack = [
+          row.sourceType || "",
+          row.sourceUrl || "",
+          row.storedUrl || "",
+          row.mime || "",
+          JSON.stringify(row.metaJson || {}),
+        ].join(" ").toLowerCase();
+        return haystack.includes(needle);
+      });
+      return filtered
+        .sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime())
+        .slice(0, limit);
+    }
+  }
+
+  async createAssetDerivative(data: AssetDerivativeInsert): Promise<AssetDerivative> {
+    try {
+      const [row] = await db.insert(assetDerivatives).values(data).returning();
+      return row;
+    } catch {
+      const row: AssetDerivative = {
+        id: randomUUID(),
+        imageId: data.imageId,
+        kind: data.kind,
+        paramsJson: (data.paramsJson as Record<string, any> | null | undefined) ?? {},
+        outputUrl: data.outputUrl ?? null,
+        createdAt: new Date(),
+      };
+      this.memoryDerivatives.unshift(row);
+      return row;
+    }
+  }
+
+  async listAssetDerivatives(imageId: string, kind?: string): Promise<AssetDerivative[]> {
+    const normalizedKind = kind?.trim();
+    try {
+      const conditions = [eq(assetDerivatives.imageId, imageId)];
+      if (normalizedKind) {
+        conditions.push(eq(assetDerivatives.kind, normalizedKind));
+      }
+      return await db.select().from(assetDerivatives)
+        .where(and(...conditions))
+        .orderBy(desc(assetDerivatives.createdAt))
+        .limit(100);
+    } catch {
+      return this.memoryDerivatives
+        .filter((row) => {
+          if (row.imageId !== imageId) return false;
+          if (normalizedKind && row.kind !== normalizedKind) return false;
+          return true;
+        })
+        .sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime());
+    }
   }
 
   async searchSku(q: string): Promise<SkuMaster[]> {

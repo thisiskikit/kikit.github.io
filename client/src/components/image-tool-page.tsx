@@ -102,7 +102,13 @@ export function ImageToolPage({ mode }: { mode: ImageMode }) {
     : "이미지 내 텍스트를 번역한 결과 이미지를 생성합니다.";
 
   const { data: images, isLoading: imagesLoading } = useQuery<AssetImage[]>({
-    queryKey: ["/api/images/list", `?q=${encodeURIComponent(query)}`],
+    queryKey: ["/api/images/list", query],
+    queryFn: async ({ queryKey }) => {
+      const [, keyword] = queryKey as [string, string];
+      const params = new URLSearchParams({ q: keyword || "" });
+      const res = await apiRequest("GET", `/api/images/list?${params.toString()}`);
+      return res.json();
+    },
   });
 
   const selectedImage = useMemo(
@@ -113,10 +119,21 @@ export function ImageToolPage({ mode }: { mode: ImageMode }) {
   const { data: derivatives } = useQuery<AssetDerivative[]>({
     queryKey: ["/api/images", selectedId || "none", "derivatives"],
     enabled: Boolean(selectedId),
+    queryFn: async ({ queryKey }) => {
+      const [, imageId] = queryKey as [string, string, string];
+      const res = await apiRequest("GET", `/api/images/${imageId}/derivatives`);
+      return res.json();
+    },
   });
 
   const { data: jobs, isLoading: jobsLoading } = useQuery<OpsJob[]>({
-    queryKey: ["/api/jobs", `?type=${jobType}&limit=20`],
+    queryKey: ["/api/jobs", jobType],
+    queryFn: async ({ queryKey }) => {
+      const [, type] = queryKey as [string, string];
+      const params = new URLSearchParams({ type, limit: "20" });
+      const res = await apiRequest("GET", `/api/jobs?${params.toString()}`);
+      return res.json();
+    },
     refetchInterval: 2000,
   });
 

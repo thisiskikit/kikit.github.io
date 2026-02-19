@@ -4,6 +4,8 @@ import { storage } from "./storage";
 import { getMockProducts, getMockProductById } from "./mock-data";
 import type { CoupangProduct, SkuMaster, ValidationResult } from "@shared/schema";
 import { parseCompositionWithLlm, type AiCompositionItem } from "./ai-composition";
+import { scheduleJob } from "./jobs";
+import { storeDataUrlImage, storeRemoteImagePlaceholder } from "./image-store";
 import ExcelJS from "exceljs";
 
 type CompositionMatch = SkuMaster & { matchScore: number };
@@ -64,6 +66,12 @@ const scoreSku = (sku: SkuMaster, query: string, primary: boolean) => {
   if (category.includes(needle)) score += 8;
   if (memo.includes(needle)) score += 5;
   return score;
+};
+
+const toSafeLimit = (raw: unknown, fallback: number, min: number, max: number) => {
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.max(min, Math.min(max, Math.floor(parsed)));
 };
 
 export async function registerRoutes(
@@ -219,21 +227,21 @@ export async function registerRoutes(
         const merged = { ...product, ...patch } as any;
 
         if (!merged.product_name || merged.product_name.trim() === "") {
-          errors.push({ productId: item.productId, field: "product_name", message: "상품명이 비어있습니다." });
+          errors.push({ productId: item.productId, field: "product_name", message: "Product name is empty." });
         }
 
         const price = Number(merged.price);
         if (isNaN(price) || price <= 0) {
-          errors.push({ productId: item.productId, field: "price", message: "가격은 0보다 커야 합니다." });
+          errors.push({ productId: item.productId, field: "price", message: "Price must be greater than 0." });
         }
 
         const salePrice = Number(merged.sale_price);
         if (!isNaN(salePrice) && salePrice > 0 && salePrice > price) {
-          warnings.push({ productId: item.productId, field: "sale_price", message: "할인가가 판매가보다 높습니다." });
+          warnings.push({ productId: item.productId, field: "sale_price", message: "Sale price is greater than price." });
         }
 
         if (merged.product_name && merged.product_name.length > 100) {
-          warnings.push({ productId: item.productId, field: "product_name", message: `상품명이 ${merged.product_name.length}자입니다. (권장: 100자 이하)` });
+          warnings.push({ productId: item.productId, field: "product_name", message: `Product name length is ${merged.product_name.length}. (Recommended <= 100)` });
         }
       }
 
@@ -260,33 +268,33 @@ export async function registerRoutes(
         const patch = (item.patchJson || {}) as Record<string, any>;
         const merged = { ...product, ...patch } as any;
         if (!merged.product_name || merged.product_name.trim() === "") {
-          errors.push({ productId: item.productId, field: "product_name", message: "상품명 누락" });
+          errors.push({ productId: item.productId, field: "product_name", message: "Missing product name" });
         }
         const price = Number(merged.price);
         if (isNaN(price) || price <= 0) {
-          errors.push({ productId: item.productId, field: "price", message: "가격 오류" });
+          errors.push({ productId: item.productId, field: "price", message: "Invalid price" });
         }
       }
 
       if (errors.length > 0) {
-        return res.status(400).json({ message: "검증 에러가 있어 Export할 수 없습니다. 먼저 검증 페이지에서 에러를 해결하세요.", errors });
+        return res.status(400).json({ message: "Validation errors exist. Resolve them before export.", errors });
       }
 
       const workbook = new ExcelJS.Workbook();
-      const sheet = workbook.addWorksheet("상품 데이터");
+      const sheet = workbook.addWorksheet("Product Data");
 
       sheet.columns = [
-        { header: "상품ID", key: "product_id", width: 18 },
-        { header: "셀러상품코드", key: "seller_product_code", width: 15 },
-        { header: "상품명", key: "product_name", width: 35 },
-        { header: "옵션", key: "option_text", width: 15 },
-        { header: "판매가", key: "price", width: 12 },
-        { header: "할인가", key: "sale_price", width: 12 },
-        { header: "상태", key: "status", width: 10 },
-        { header: "카테고리ID", key: "category_id", width: 12 },
-        { header: "메인이미지", key: "images_main", width: 40 },
-        { header: "서브이미지", key: "images_sub", width: 40 },
-        { header: "메모", key: "memo", width: 20 },
+        { header: "Product ID", key: "product_id", width: 18 },
+        { header: "Seller Code", key: "seller_product_code", width: 15 },
+        { header: "Product Name", key: "product_name", width: 35 },
+        { header: "Option", key: "option_text", width: 15 },
+        { header: "Price", key: "price", width: 12 },
+        { header: "Sale Price", key: "sale_price", width: 12 },
+        { header: "Status", key: "status", width: 10 },
+        { header: "Category ID", key: "category_id", width: 12 },
+        { header: "Main Image", key: "images_main", width: 40 },
+        { header: "Sub Image", key: "images_sub", width: 40 },
+        { header: "Memo", key: "memo", width: 20 },
       ];
 
       const headerRow = sheet.getRow(1);
@@ -312,17 +320,20 @@ export async function registerRoutes(
   });
 
   // ========================
-  // E) Jobs (공통)
+  // E) Jobs (shared)
   // ========================
   app.post("/api/jobs", async (req, res) => {
     try {
       const { type, payload, created_by } = req.body;
+      if (!type) return res.status(400).json({ message: "type is required" });
+
       const job = await storage.createJob({
         type,
         status: "queued",
         payloadJson: payload || {},
         createdBy: created_by || "system",
       });
+      scheduleJob(job);
       res.json(job);
     } catch (err: any) {
       res.status(500).json({ message: err.message });
@@ -344,8 +355,8 @@ export async function registerRoutes(
       const jobs = await storage.getJobs({
         type: req.query.type as string,
         status: req.query.status as string,
-        limit: parseInt(req.query.limit as string) || 20,
-        offset: parseInt(req.query.offset as string) || 0,
+        limit: toSafeLimit(req.query.limit, 20, 1, 200),
+        offset: toSafeLimit(req.query.offset, 0, 0, 5000),
       });
       res.json(jobs);
     } catch (err: any) {
@@ -354,7 +365,7 @@ export async function registerRoutes(
   });
 
   // ========================
-  // F) Feature APIs (stubs)
+  // F) Feature APIs
   // ========================
   app.post("/api/crawl", async (req, res) => {
     try {
@@ -365,6 +376,7 @@ export async function registerRoutes(
         payloadJson: { url },
         createdBy: created_by || "system",
       });
+      scheduleJob(job);
       res.json({ jobId: job.id, status: "queued" });
     } catch (err: any) {
       res.status(500).json({ message: err.message });
@@ -380,6 +392,7 @@ export async function registerRoutes(
         payloadJson: { items: editItems },
         createdBy: created_by || "system",
       });
+      scheduleJob(job);
       res.json({ jobId: job.id, status: "queued" });
     } catch (err: any) {
       res.status(500).json({ message: err.message });
@@ -389,12 +402,17 @@ export async function registerRoutes(
   app.post("/api/images/translate", async (req, res) => {
     try {
       const { imageId, imageUrl, targetLang, created_by } = req.body;
+      if (!imageId && !imageUrl) {
+        return res.status(400).json({ message: "imageId or imageUrl is required" });
+      }
+
       const job = await storage.createJob({
         type: "IMAGE_TRANSLATE",
         status: "queued",
         payloadJson: { imageId, imageUrl, targetLang: targetLang || "ko" },
         createdBy: created_by || "system",
       });
+      scheduleJob(job);
       res.json({ jobId: job.id, status: "queued" });
     } catch (err: any) {
       res.status(500).json({ message: err.message });
@@ -404,29 +422,85 @@ export async function registerRoutes(
   app.post("/api/images/cutout", async (req, res) => {
     try {
       const { imageId, imageUrl, mask, created_by } = req.body;
+      if (!imageId && !imageUrl) {
+        return res.status(400).json({ message: "imageId or imageUrl is required" });
+      }
+
       const job = await storage.createJob({
         type: "IMAGE_CUTOUT",
         status: "queued",
         payloadJson: { imageId, imageUrl, mask },
         createdBy: created_by || "system",
       });
+      scheduleJob(job);
       res.json({ jobId: job.id, status: "queued" });
     } catch (err: any) {
       res.status(500).json({ message: err.message });
     }
   });
 
-  // G) Image hosting stubs
-  app.post("/api/images/upload", async (_req, res) => {
-    // TODO: 실제 서버 경로 D:\Dev\hosting\uploads
-    res.json({ storedUrl: "https://img.aboutfactory.co.kr/mock/uploaded-image.jpg", message: "Mock upload (stub)" });
+  // G) Image APIs
+  app.post("/api/images/upload", async (req, res) => {
+    try {
+      const dataUrl = String(req.body?.dataUrl || "").trim();
+      const sourceUrl = String(req.body?.sourceUrl || "").trim();
+      const name = String(req.body?.name || "").trim() || null;
+
+      if (!dataUrl && !sourceUrl) {
+        return res.status(400).json({ message: "dataUrl or sourceUrl is required" });
+      }
+
+      let image;
+      if (dataUrl) {
+        const stored = await storeDataUrlImage(dataUrl, name);
+        image = await storage.createAssetImage({
+          sourceType: "upload",
+          sourceUrl: null,
+          storedUrl: stored.storedUrl,
+          mime: stored.mime,
+          metaJson: {
+            originalName: stored.originalName,
+            size: stored.size,
+          },
+        });
+      } else {
+        const stored = storeRemoteImagePlaceholder(sourceUrl);
+        image = await storage.createAssetImage({
+          sourceType: "remote",
+          sourceUrl,
+          storedUrl: stored.storedUrl,
+          mime: stored.mime,
+          metaJson: {
+            originalName: name || stored.originalName,
+          },
+        });
+      }
+
+      res.json(image);
+    } catch (err: any) {
+      res.status(500).json({ message: err.message });
+    }
   });
 
-  app.get("/api/images/list", async (_req, res) => {
-    res.json([
-      { url: "https://img.aboutfactory.co.kr/mock/sample1.jpg", name: "sample1.jpg" },
-      { url: "https://img.aboutfactory.co.kr/mock/sample2.jpg", name: "sample2.jpg" },
-    ]);
+  app.get("/api/images/list", async (req, res) => {
+    try {
+      const q = String(req.query.q || "").trim();
+      const limit = toSafeLimit(req.query.limit, 100, 1, 200);
+      const images = await storage.listAssetImages({ q, limit });
+      res.json(images);
+    } catch (err: any) {
+      res.status(500).json({ message: err.message });
+    }
+  });
+
+  app.get("/api/images/:id/derivatives", async (req, res) => {
+    try {
+      const kind = String(req.query.kind || "").trim() || undefined;
+      const derivatives = await storage.listAssetDerivatives(req.params.id, kind);
+      res.json(derivatives);
+    } catch (err: any) {
+      res.status(500).json({ message: err.message });
+    }
   });
 
   // SKU search
@@ -520,3 +594,4 @@ export async function registerRoutes(
 
   return httpServer;
 }
+
